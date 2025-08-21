@@ -1,0 +1,6 @@
+aiogram==3.21.0
+requests==2.32.3
+python-docx==1.2.0
+pandas==2.3.0
+openpyxl==3.1.5
+aiohttp==3.12.14 
