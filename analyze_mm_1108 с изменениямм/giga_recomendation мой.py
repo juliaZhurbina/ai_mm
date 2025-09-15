@@ -55,13 +55,13 @@ class MeetingAnalyzer:
 
             courses_dict = {}
             for _, row in df.iterrows():
-                comp = row.get('компетенция', '')
-                indicator = row.get('Поведенческие проявления (индикаторы)', '')
-                courses = row.get('курсы', '')
+                comp = row.get('компетенция', '').strip()
+                indicator = row.get('Поведенческие проявления (индикаторы)', '').strip()
+                courses = row.get('курсы', '').strip()
 
                 if comp and courses:
                     key = f"{comp} - {indicator}" if indicator else comp
-                    course_list = [c.strip() for c in str(courses).split(',') if c.strip()]
+                    course_list = [c.strip() for c in courses.split(',') if c.strip()]
                     if course_list:
                         courses_dict[key] = course_list
 
@@ -76,9 +76,12 @@ class MeetingAnalyzer:
         lines = report_text.split('\n')
 
         for line in lines:
+            # Ищем строки с компетенциями (с эмодзи или без)
             if ('🔴' in line or '🟡' in line or '🟢' in line) and '**' in line:
+                # Извлекаем название компетенции
                 comp_name = line.split('**')[1].split('**')[0]
                 low_score_competencies.append(comp_name)
+            # Также ищем строки с "🏆" (заголовки компетенций)
             elif '🏆' in line and ' - средний балл' in line:
                 comp_name = line.split('🏆')[1].split(' - средний балл')[0].strip()
                 low_score_competencies.append(comp_name)
@@ -89,28 +92,30 @@ class MeetingAnalyzer:
         if not self.is_token_valid() and not self.get_access_token():
             return "Ошибка: не удалось получить токен доступа"
 
+        # Чтение текста встречи из файла
         try:
             trans = self.read_docx('./trans.docx')
         except Exception as e:
             return f"Ошибка чтения файла: {str(e)}"
 
-        prompt = f"""Проанализируй текст встречи и сформируй рекомендации:
+        prompt = f"""Проанализируй текст встречи и сформируй рекомендации в следующем формате:
 
 Итоги ММ
 
-Твой голос и речь были [позитивны/нейтральны/негативны], [доброжелательны/формальны/холодны]. 
+Твой голос и речь были [позитивны/нейтральны/негативны], [доброжелательны/формальны/холодны], [располагающие к ОС/нейтральные/отталкивающие]. 
 Ты вовлёк в обсуждение [N] из [M] присутствующих ММК. 
-Ты [пропустил/не пропустил] важный этап.
-[Соблюдён тайминг/Не соблюдён].
-[Один/Несколько/Никто] из [M] участников ММК погрузился в бизнес клиента.
-При этом [не погрузился/погрузился] в клиента.
+Ты [пропустил/не пропустил] важный этап - [не озвучил правила проведения ММ/озвучил правила]/участникам важно помнить формат обучения. 
+В момент обсуждения [не ознучивались/озвучивались] персональные данные клиента, это [хорошо/плохо], Кибербезопасность превыше всего. 
+[Соблюдён тайминг/Не соблюдён, потренируйся короче формулировать свои мысли]. 
+[Один/Несколько/Никто] из [M] участников ММК [ФИО] погрузился в бизнес клиента, его задачи и планы. 
+При этом [не погрузился/погрузился] в клиента, не узнал о его интересах и хобби. 
 Уточняющие вопросы о клиенте задавали [N] из [M] ММК. 
-Ты [не предложил/предложил] команде поиск решения.
-При этом тобой [использовались слова паразиты/не использовал слова паразиты]. 
-Ты [перебивал/не перебивал] речь.
-В итоге [ребята не сформулировали свою идею/сформулировали свои идеи]. 
+Ты [не предложил/предложил] команде поиск решения, что [не позволило/позволило] тебе вовлечь всех сотрудников. 
+При этом тобой [использовались слова паразиты (более 3 раз)/не использовал слова паразиты (более 3 раз)]. 
+Ты [перебивал/не перебивал] речь [ФИО]. 
+В итоге [ребята не сформулировали свою идею/предложения/сформулировали свои идеи]. 
 [Были/Не было] признаков активного слушания. 
-По итогам ММ [N] из [M] ребят не сформулировали ценность встречи.
+По итогам ММ [N] из [M] ребят не сформулировали ценность встречи. И не поделились своими мыслями.
 
 Рекомендации РМ
 
@@ -127,12 +132,15 @@ class MeetingAnalyzer:
         return self._send_request(prompt)
 
     def _compress_text(self, text, max_length=500):
+        """Сжимает текст, убирая лишние пробелы и переносы"""
+        # Убираем лишние пробелы и переносы
         compressed = ' '.join(text.split())
         if len(compressed) > max_length:
             compressed = compressed[:max_length] + "..."
         return compressed
 
     def _send_request(self, prompt):
+        """Отправка запроса к GigaChat API"""
         headers = {
             'Authorization': f'Bearer {self.access_token}',
             'Content-Type': 'application/json'
@@ -140,7 +148,12 @@ class MeetingAnalyzer:
 
         payload = {
             "model": "GigaChat",
-            "messages": [{"role": "user", "content": prompt}],
+            "messages": [
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ],
             "temperature": 0.7,
             "top_p": 0.9,
             "n": 1,
@@ -157,62 +170,93 @@ class MeetingAnalyzer:
             return f"Ошибка анализа встречи: {response.status_code} - {response.text}"
 
     def _extract_competencies_with_scores(self, report_text):
+        """Извлекает компетенции с баллами из отчета"""
         competencies_with_scores = {}
         lines = report_text.split('\n')
 
+        print(f"DEBUG: Всего строк в отчете: {len(lines)}")
+        found_count = 0
+
         for i, line in enumerate(lines):
+            # Ищем строки с "🏆" (заголовки компетенций в детальном отчёте)
             if '🏆' in line and ' - средний балл' in line:
+                found_count += 1
+                print(f"DEBUG: Найдена строка {i}: {line}")
                 comp_name = line.split('🏆')[1].split(' - средний балл')[0].strip()
+                # Ищем балл после "средний балл"
                 score_match = line.split('средний балл')[1].split()[0]
                 try:
                     score = float(score_match)
                     competencies_with_scores[comp_name] = score
+                    print(f"DEBUG: Найдена компетенция '{comp_name}' с баллом {score}")
                 except:
+                    print(f"DEBUG: Не удалось извлечь балл из строки: {line}")
                     pass
 
+        print(f"DEBUG: Всего найдено строк с 🏆: {found_count}")
+        print(f"DEBUG: Всего найдено компетенций с баллами: {len(competencies_with_scores)}")
+        print(f"DEBUG: Компетенции: {competencies_with_scores}")
         return competencies_with_scores
 
     def analyze_meeting_with_file(self, file_path=None, user_id=None):
+        """Анализ встречи с уже загруженным файлом пользователя (без повторной загрузки)"""
+        # Если file_path не передан — ищем trans.docx в temp_files/{user_id}/trans.docx
         if file_path is None:
             if user_id is None:
                 return "❌ Ошибка: Не указан путь к файлу и user_id."
             file_path = f"temp_files/{user_id}/trans.docx"
-
         if not self.is_token_valid() and not self.get_access_token():
             return "Ошибка: не удалось получить токен доступа"
 
+        # Чтение текста встречи из файла
         try:
             trans = self.read_docx(file_path)
         except Exception as e:
             return f"Ошибка чтения файла: {str(e)}"
 
+        if not self.is_token_valid() and not self.get_access_token():
+            return "Ошибка: не удалось получить токен доступа"
+
+        # Читаем отчет по компетенциям (обязательно)
         competency_report = ""
         try:
             if os.path.exists('REPORT.txt'):
                 with open('REPORT.txt', 'r', encoding='utf-8') as f:
                     full_report = f.read()
+                    print(f"DEBUG: Размер REPORT.txt: {len(full_report)} символов")
+                    # Увеличиваем лимит отчета (максимум 1000000 символов)
                     if len(full_report) > 1000000:
                         competency_report = full_report[:1000000] + "\n\n[Отчет обрезан для экономии места]"
+                        print(f"DEBUG: Отчет обрезан до 1000000 символов")
                     else:
                         competency_report = full_report
+                        print(f"DEBUG: Используется полный отчет")
+                print(f"DEBUG: Используется файл: REPORT.txt")
             else:
-                return "❌ Ошибка: Файл REPORT.txt не найден."
+                return "❌ Ошибка: Файл REPORT.txt не найден. Сначала выполните анализ компетенций."
         except Exception as e:
             return f"❌ Ошибка чтения отчета компетенций: {str(e)}"
 
+        # Загружаем курсы из файла триггеров
         triggers_file_path = 'triggers.xlsx'
         if not os.path.exists(triggers_file_path):
             return "❌ Ошибка: Файл triggers.xlsx не найден."
 
         courses_dict = self._load_triggers_courses(triggers_file_path)
+
+        # Извлекаем компетенции с проблемами и баллами из отчета
         problem_competencies = self._extract_competencies_from_report(competency_report)
         competencies_with_scores = self._extract_competencies_with_scores(competency_report)
+
+        # Сжимаем отчет компетенций для уменьшения размер запроса
         competency_report = self._compress_text(competency_report, 600)
 
+        # Формируем строку с актуальными курсами
         courses_text = ""
         if courses_dict and problem_competencies:
             courses_text = "\n\n📚 ДОСТУПНЫЕ КУРСЫ ДЛЯ РЕКОМЕНДАЦИЙ:\n"
             for comp in problem_competencies:
+                # Ищем курсы для этой компетенции
                 for key, courses in courses_dict.items():
                     if comp.lower() in key.lower():
                         courses_text += f"- {comp}:\n"
@@ -220,11 +264,18 @@ class MeetingAnalyzer:
                             courses_text += f"  • {course}\n"
                         break
 
+        # Формируем строку с точными баллами
         scores_text = ""
         if competencies_with_scores:
             scores_text = "\n\n📊 ТОЧНЫЕ БАЛЛЫ ИЗ ОТЧЁТА:\n"
             for comp, score in competencies_with_scores.items():
                 scores_text += f"- {comp}: {score}/10\n"
+
+        # Отладочная информация
+        print(f"DEBUG: Найдено компетенций с баллами: {len(competencies_with_scores)}")
+        print(f"DEBUG: Компетенции: {list(competencies_with_scores.keys())}")
+        print(f"DEBUG: Курсы: {courses_text}")
+        print(f"DEBUG: Баллы: {scores_text}")
 
         prompt = f"""Проанализируй текст встречи и отчет по компетенциям, затем сформируй детальные рекомендации:
 
@@ -242,7 +293,7 @@ class MeetingAnalyzer:
 
 {scores_text}
 
-КРИТИЧЕСКИ ВАЖНО: Используй ТОЛЬКО курсы из списка выше для рекомендаций. НЕ придумывай новые курсы.
+КРИТИЧЕСКИ ВАЖНО: Используй ТОЛЬКО курсы из списка выше для рекомендаций. НЕ придумывай новые курсы. Если для компетенции нет курсов в списке, не указывай курсы вообще.
 
 ВАЖНО: Используй ТОЧНЫЕ БАЛЛЫ из списка выше. НЕ придумывай баллы.
 
@@ -253,7 +304,7 @@ class MeetingAnalyzer:
 
 СОЗДАЙ РЕКОМЕНДАЦИИ ДЛЯ ВСЕХ КОМПЕТЕНЦИЙ ИЗ СПИСКА ВЫШЕ:
 
-ВАЖНО: Создай отдельный блок рекомендаций для КАЖДОЙ компетенции из списка баллов выше.
+ВАЖНО: Создай отдельный блок рекомендаций для КАЖДОЙ компетенции из списка баллов выше. НЕ пропускай ни одной компетенции.
 
 [Для каждой компетенции из списка создай блок в формате:]
 
@@ -319,6 +370,7 @@ if __name__ == "__main__":
         print("Результат анализа встречи:")
         print(analysis_result)
 
+        # Сохранение результата в файл
         with open('meeting_analysis.txt', 'w', encoding='utf-8') as f:
             f.write(analysis_result)
         print("\nРезультат сохранён в файл meeting_analysis.txt")
