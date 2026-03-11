@@ -1,18 +1,29 @@
 import json
 import os
+import re
 from docx import Document
 from typing import Dict, Tuple
 import asyncio
 from gigachat import GigaChat
+import logging
 
 # Импортируем необходимые модули для работы с GigaChat
 from giga_recomendation import MeetingAnalyzer
+
+# Импортируем RAG систему для улучшения промптов
+try:
+    from rag_system import get_rag_system
+    RAG_AVAILABLE = True
+    logging.info("RAG система доступна для улучшения промптов")
+except ImportError:
+    RAG_AVAILABLE = False
+    logging.warning("RAG система недоступна. Промпты будут использоваться без улучшения.")
 
 
 class ScenarioChecker:
     """Класс для проверки соответствия встречи сценарию с использованием GigaChat"""
 
-    def __init__(self, prompts_file='scenario_prompts.json'):
+    def __init__(self, prompts_file='scenario_prompts.json', use_rag=True):
         # Настройки для GigaChat
         AUTH_KEY = 'ZGMzMGJmZjEtODQwYS00ZjAwLWI2NjgtNGIyNGNiY2ViNmE1OjY1MzcyY2I3LWEwMjUtNDkyYi04ZjJhLTEyNmRkMjM2NDNhYg=='
         SCOPE = 'GIGACHAT_API_PERS'
@@ -21,6 +32,19 @@ class ScenarioChecker:
 
         self.analyzer = MeetingAnalyzer(AUTH_KEY, SCOPE, API_AUTH_URL, API_CHAT_URL)
 
+        # Инициализация RAG системы (если доступна)
+        self.use_rag = use_rag and RAG_AVAILABLE
+        self.rag_system = None
+        
+        if self.use_rag:
+            try:
+                self.rag_system = get_rag_system()
+                logging.info("✅ RAG система подключена для улучшения промптов")
+            except Exception as e:
+                logging.warning(f"Не удалось инициализировать RAG: {e}")
+                self.use_rag = False
+        else:
+            logging.info("RAG отключена, используем базовые промпты")
 
         # Загрузка промптов из файла
         self.prompts_file = prompts_file
@@ -82,6 +106,24 @@ class ScenarioChecker:
             # Выполняем запрос к GigaChat
             analysis_result = await self._execute_gigachat_request(full_prompt)
 
+            # Для универсального сценария: убираем #### и гарантируем зелёную галочку при «соответствует»
+            if scenario_type == 'scenario_universal':
+                analysis_result = analysis_result.replace('#### ', '').replace('####', '').strip()
+                # Если модель написала «соответствует» без галочки — добавляем ✅
+                analysis_result = re.sub(
+                    r'(Статус:\s*)(?!\s*✅)соответствует',
+                    r'\1✅ соответствует',
+                    analysis_result,
+                    flags=re.IGNORECASE
+                )
+                # Если модель написала «не соответствует» без ⚠️ — добавляем оранжевый восклицательный знак
+                analysis_result = re.sub(
+                    r'(Статус:\s*)(?!\s*⚠️)не соответствует',
+                    r'\1⚠️ не соответствует',
+                    analysis_result,
+                    flags=re.IGNORECASE
+                )
+
             # Форматируем итоговый результат
             return self._format_final_result(analysis_result, scenario_name)
 
@@ -92,13 +134,68 @@ class ScenarioChecker:
             return self._escape_telegram_chars(error_msg)
 
     def _build_full_prompt(self, meeting_text: str, prompt_template: str, scenario_name: str) -> str:
-        """Создание полного промпта для анализа"""
-        return f"""
+        """
+        Создание полного промпта для анализа
+        
+        Что делает:
+        1. Создает базовый промпт с текстом встречи
+        2. Если RAG доступна - улучшает промпт контекстом из базы знаний
+        3. Возвращает финальный промпт для GigaChat
+        """
+        # Определяем тип сценария из scenario_name (нужно до сборки промпта)
+        scenario_type = None
+        for key, name in self.scenario_names.items():
+            if name == scenario_name:
+                scenario_type = key
+                break
+        if not scenario_type:
+            scenario_type = 'scenario_universal'
+
+        # Для универсального сценария вставляем жёсткое напоминание о формате перед текстом встречи
+        if scenario_type == 'scenario_universal':
+            format_reminder = (
+                "\n\n[КРИТИЧЕСКИ ВАЖНО — СТРОГО СОБЛЮДАЙ] "
+                "При СООТВЕТСТВУЕТ: только «Статус: ✅ соответствует», без Оценка. "
+                "При НЕ СООТВЕТСТВУЕТ: «Статус: ⚠️ не соответствует» и Оценка (1-2 предложения)."
+            )
+            base_prompt = f"""
+{prompt_template}{format_reminder}
+
+ТЕКСТ ВСТРЕЧИ ДЛЯ АНАЛИЗА:
+{meeting_text}
+"""
+        else:
+            base_prompt = f"""
 {prompt_template}
 
 ТЕКСТ ВСТРЕЧИ ДЛЯ АНАЛИЗА:
 {meeting_text}
 """
+
+        # Для универсального сценария RAG не используем — возвращаем промпт как есть (формат уже в нём)
+        if scenario_type == 'scenario_universal':
+            return base_prompt
+
+        # Шаг 2: Улучшаем промпт через RAG (если доступна) для остальных сценариев
+        if self.use_rag and self.rag_system:
+            try:
+                # Улучшаем промпт контекстом из базы знаний
+                enhanced_prompt = self.rag_system.enhance_prompt(
+                    base_prompt=base_prompt,
+                    query_text=meeting_text[:2000],  # Используем первые 2000 символов для поиска
+                    scenario_type=scenario_type
+                )
+                
+                logging.info(f"✅ Промпт улучшен контекстом из RAG базы знаний (тип: {scenario_type})")
+                return enhanced_prompt
+                
+            except Exception as e:
+                logging.warning(f"Ошибка улучшения промпта через RAG: {e}")
+                # Если ошибка - возвращаем базовый промпт
+                return base_prompt
+        
+        # Если RAG недоступна - возвращаем базовый промпт
+        return base_prompt
 
     async def _execute_gigachat_request(self, prompt: str) -> str:
         """Выполнение запроса к GigaChat"""

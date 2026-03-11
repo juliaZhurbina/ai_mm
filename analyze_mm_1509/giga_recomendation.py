@@ -141,6 +141,7 @@ class MeetingAnalyzer:
         print("=" * 80)
         print(f"URL API: {self.api_chat_url}")
         print(f"Модель: GigaChat-2-Pro")
+        #print(f"Модель: GigaChat")
         print(f"Общая длина промпта: {len(prompt)} символов")
         print(f"Токен доступа: {'ЕСТЬ' if self.access_token else 'ОТСУТСТВУЕТ'}")
 
@@ -176,6 +177,7 @@ class MeetingAnalyzer:
 
         payload = {
             "model": "GigaChat-2-Pro",
+            #"model": "GigaChat",
             "messages": [{"role": "user", "content": prompt}],
             "temperature": 0.7,
             "top_p": 0.9,

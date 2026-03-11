@@ -8,16 +8,18 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 import os
 from datetime import datetime
+from docx import Document
 from scenario_checker import check_meeting_scenario, safe_telegram_message
 
 # Импортируем модуль для проверки критериев успеха
-from success_criteria import check_success_criteria
+from success_criteria import check_success_criteria, find_meeting_file
 
 # Настройка логирования
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
+logger = logging.getLogger(__name__)
 
 # Конфигурация бота
 BOT_TOKEN = "8079592721:AAGLaX7LwUPX0X5fr1SK-9IQnSvfP3Z96ws"
@@ -30,6 +32,7 @@ dp = Dispatcher(storage=storage)
 class UserStates(StatesGroup):
     waiting_for_scenario_check = State()
     waiting_for_success_criteria = State()  # Новое состояние для проверки критериев успеха
+    asking_about_existing_file = State()  # Состояние для вопроса о ранее загруженной транскрибации
 
 
 def escape_telegram_chars(text: str) -> str:
@@ -72,16 +75,24 @@ def filter_facilitator_speech(text):
 
 
 def read_docx_filtered(file_path):
-    """Чтение и фильтрация текста из файла .docx"""
+    """Чтение и фильтрация текста из файла .docx или .txt"""
     try:
-        from docx import Document
-        doc = Document(file_path)
-        full_text = []
-        for paragraph in doc.paragraphs:
-            if paragraph.text.strip():
-                full_text.append(paragraph.text)
+        file_ext = os.path.splitext(file_path)[1].lower()
+        
+        if file_ext == '.txt':
+            # Читаем .txt файл
+            with open(file_path, 'r', encoding='utf-8') as f:
+                original_text = f.read()
+        else:
+            # Читаем .docx файл
+            from docx import Document
+            doc = Document(file_path)
+            full_text = []
+            for paragraph in doc.paragraphs:
+                if paragraph.text.strip():
+                    full_text.append(paragraph.text)
+            original_text = '\n'.join(full_text)
 
-        original_text = '\n'.join(full_text)
         print(f"DEBUG: Оригинальный размер текста: {len(original_text)} символов")
 
         # Фильтруем речь ведущего
@@ -89,6 +100,17 @@ def read_docx_filtered(file_path):
         print(f"DEBUG: Размер после фильтрации: {len(filtered_text)} символов")
 
         return filtered_text
+    except UnicodeDecodeError:
+        # Пробуем другие кодировки для .txt
+        try:
+            with open(file_path, 'r', encoding='cp1251') as f:
+                original_text = f.read()
+            filtered_text = filter_facilitator_speech(original_text)
+            return filtered_text
+        except Exception as e:
+            error_msg = f"Ошибка чтения файла: {str(e)}"
+            print(escape_telegram_chars(error_msg))
+            return ""
     except Exception as e:
         error_msg = f"Ошибка чтения файла: {str(e)}"
         print(escape_telegram_chars(error_msg))
@@ -116,6 +138,131 @@ def save_filtered_text_to_file(filtered_text, filename_prefix="filtered_meeting"
         return None
 
 
+def save_result_to_docx(result_text, original_filename, result_type="scenario", user_id=None):
+    """
+    Сохраняет результат проверки в файл docx
+    
+    Args:
+        result_text: текст результата проверки
+        original_filename: имя исходного загруженного файла
+        result_type: тип проверки ("scenario" или "competencies")
+        user_id: ID пользователя для сохранения в его папку
+    
+    Returns:
+        путь к сохраненному файлу или None при ошибке
+    """
+    try:
+        # Пытаемся получить оригинальное имя файла из сохраненного файла
+        display_filename = original_filename
+        if user_id:
+            user_folder = f"temp_files/{user_id}"
+            original_filename_path = f"{user_folder}/original_filename.txt"
+            if os.path.exists(original_filename_path):
+                try:
+                    with open(original_filename_path, 'r', encoding='utf-8') as f:
+                        saved_filename = f.read().strip()
+                        if saved_filename:
+                            display_filename = saved_filename
+                except Exception as e:
+                    logger.warning(f"Не удалось прочитать оригинальное имя файла: {e}")
+        
+        # Извлекаем имя файла без расширения
+        if display_filename:
+            # Убираем расширение
+            base_name = os.path.splitext(os.path.basename(display_filename))[0]
+        else:
+            base_name = "файл"
+        
+        # Формируем имя файла результата
+        if result_type == "scenario":
+            result_filename = f"проверка соотв. сценарию_{base_name}.docx"
+        elif result_type == "competencies":
+            result_filename = f"проверка компетенций модератора_{base_name}.docx"
+        else:
+            result_filename = f"результат проверки_{base_name}.docx"
+        
+        # Определяем папку для сохранения
+        if user_id:
+            save_folder = f"temp_files/{user_id}"
+            os.makedirs(save_folder, exist_ok=True)
+            file_path = os.path.join(save_folder, result_filename)
+        else:
+            save_folder = "temp_files"
+            os.makedirs(save_folder, exist_ok=True)
+            file_path = os.path.join(save_folder, result_filename)
+        
+        # Создаем документ Word
+        doc = Document()
+        
+        # Добавляем заголовок
+        if result_type == "scenario":
+            doc.add_heading('Результат проверки соответствия сценарию', level=1)
+        elif result_type == "competencies":
+            doc.add_heading('Результат проверки компетенций модератора ММ', level=1)
+        else:
+            doc.add_heading('Результат проверки', level=1)
+        
+        # Добавляем информацию об исходном файле (используем оригинальное имя)
+        if display_filename:
+            doc.add_paragraph(f'Исходный файл: {os.path.basename(display_filename)}')
+            doc.add_paragraph(f'Дата проверки: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}')
+            doc.add_paragraph('')  # Пустая строка
+        
+        # Обрабатываем текст результата построчно для лучшей обработки markdown
+        lines = result_text.split('\n')
+        current_paragraph = []
+        
+        for line in lines:
+            line = line.strip()
+            
+            if not line:
+                # Пустая строка - завершаем текущий параграф
+                if current_paragraph:
+                    para_text = ' '.join(current_paragraph)
+                    # Убираем markdown форматирование
+                    para_text = para_text.replace('**', '').replace('*', '').replace('`', '').replace('_', '')
+                    if para_text:
+                        doc.add_paragraph(para_text)
+                    current_paragraph = []
+            elif line.startswith('#'):
+                # Заголовок markdown
+                if current_paragraph:
+                    # Завершаем предыдущий параграф
+                    para_text = ' '.join(current_paragraph)
+                    para_text = para_text.replace('**', '').replace('*', '').replace('`', '').replace('_', '')
+                    if para_text:
+                        doc.add_paragraph(para_text)
+                    current_paragraph = []
+                
+                # Обрабатываем заголовок
+                level = len(line) - len(line.lstrip('#'))
+                heading_text = line.lstrip('#').strip()
+                # Убираем markdown форматирование из заголовка
+                heading_text = heading_text.replace('**', '').replace('*', '').replace('`', '').replace('_', '')
+                if heading_text:
+                    doc.add_heading(heading_text, level=min(level, 3))
+            else:
+                # Обычная строка - добавляем к текущему параграфу
+                current_paragraph.append(line)
+        
+        # Добавляем последний параграф, если он есть
+        if current_paragraph:
+            para_text = ' '.join(current_paragraph)
+            para_text = para_text.replace('**', '').replace('*', '').replace('`', '').replace('_', '')
+            if para_text:
+                doc.add_paragraph(para_text)
+        
+        # Сохраняем документ
+        doc.save(file_path)
+        
+        logger.info(f"✅ Результат проверки сохранен в файл: {file_path}")
+        return file_path
+        
+    except Exception as e:
+        logger.error(f"❌ Ошибка при сохранении результата в docx: {e}")
+        return None
+
+
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     """Обработчик команды /start"""
@@ -136,16 +283,173 @@ async def cmd_start(message: types.Message):
 
 @dp.callback_query(lambda c: c.data == "check_success_criteria")
 async def check_success_criteria_handler(callback: types.CallbackQuery, state: FSMContext):
-    """Обработчик кнопки 'Общие критерии успеха ММ'"""
-    await state.set_state(UserStates.waiting_for_success_criteria)
+    """Обработчик кнопки 'Проверить компетенции модератора ММ'"""
+    try:
+        user_id = callback.from_user.id
+        
+        # Проверяем, есть ли ранее загруженная транскрибация
+        try:
+            existing_file = find_meeting_file(user_id)
+        except Exception as e:
+            logger.error(f"Ошибка при поиске файла: {e}")
+            existing_file = None
+        
+        if existing_file and os.path.exists(existing_file):
+            # Если есть ранее загруженный файл - спрашиваем пользователя с указанием имени файла
+            await state.set_state(UserStates.asking_about_existing_file)
+            
+            # Пытаемся получить оригинальное имя файла
+            user_folder = f"temp_files/{user_id}"
+            original_filename_path = f"{user_folder}/original_filename.txt"
+            display_filename = os.path.basename(existing_file)
+            
+            if os.path.exists(original_filename_path):
+                try:
+                    with open(original_filename_path, 'r', encoding='utf-8') as f:
+                        saved_filename = f.read().strip()
+                        if saved_filename:
+                            display_filename = saved_filename
+                except Exception as e:
+                    logger.warning(f"Не удалось прочитать оригинальное имя файла: {e}")
+            
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="✅ Да, проверить по загруженной ранее", callback_data="use_existing_file")],
+                [InlineKeyboardButton(text="📄 Нет, загрузить новую транскрибацию", callback_data="upload_new_file")],
+                [InlineKeyboardButton(text="❌ Отменить", callback_data="cancel_operation")]
+            ])
+            
+            # Экранируем специальные символы Markdown в имени файла
+            safe_filename = escape_telegram_chars(display_filename)
+            
+            await callback.message.answer(
+                f"🏆 **Проверка компетенций модератора ММ**\n\n"
+                f"📋 Проверить ранее загруженную транскрибацию \"{safe_filename}\"?",
+                reply_markup=keyboard,
+                parse_mode="Markdown"
+            )
+        else:
+            # Если нет ранее загруженного файла - сразу просим загрузить новый
+            await state.set_state(UserStates.waiting_for_success_criteria)
+            
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="❌ Отменить", callback_data="cancel_operation")]
+            ])
+            
+            await callback.message.answer(
+                "🏆 **Проверка компетенций модератора ММ**\n\n"
+                "📄 Отправьте файл с текстом встречи (.docx или .txt) для проверки соответствия компетенциям модератора ММ.\n\n"
+                "Для отмены нажмите кнопку ниже или отправьте /cancel",
+                reply_markup=keyboard,
+                parse_mode="Markdown"
+            )
+        
+        await callback.answer()
+        
+    except Exception as e:
+        logger.error(f"Ошибка в check_success_criteria_handler: {e}", exc_info=True)
+        try:
+            await callback.message.answer(
+                "❌ Произошла ошибка при обработке запроса. Попробуйте еще раз или обратитесь к администратору."
+            )
+            await callback.answer()
+        except Exception:
+            pass
 
+
+@dp.callback_query(lambda c: c.data == "use_existing_file")
+async def use_existing_file_handler(callback: types.CallbackQuery, state: FSMContext):
+    """Обработчик кнопки 'Да, проверить по загруженной ранее'"""
+    user_id = callback.from_user.id
+    
+    # Ищем ранее загруженный файл
+    file_path = find_meeting_file(user_id)
+    
+    if not file_path:
+        await callback.message.answer(
+            "❌ Ранее загруженная транскрибация не найдена. Пожалуйста, загрузите файл."
+        )
+        await state.set_state(UserStates.waiting_for_success_criteria)
+        await callback.answer()
+        return
+    
+    await callback.message.answer(
+        f"✅ Использую ранее загруженную транскрибацию: {os.path.basename(file_path)}\n\n"
+        "🔄 Анализирую текст встречи..."
+    )
+    
+    # Показываем индикатор обработки
+    processing_msg = await callback.message.answer("⏳ Обрабатываю...")
+    
+    try:
+        # Вызываем функцию проверки критериев успеха
+        success_result = await check_success_criteria(file_path=file_path, user_id=user_id)
+        
+        # Сохраняем результат проверки в файл docx
+        original_filename = os.path.basename(file_path)
+        result_file_path = save_result_to_docx(
+            result_text=success_result,
+            original_filename=original_filename,
+            result_type="competencies",
+            user_id=user_id
+        )
+        if result_file_path:
+            logger.info(f"📄 Результат проверки компетенций сохранен: {result_file_path}")
+        
+        # Удаляем индикатор обработки
+        await bot.delete_message(chat_id=callback.message.chat.id, message_id=processing_msg.message_id)
+        
+        # Безопасная отправка результата пользователю
+        message_parts = safe_telegram_message(success_result)
+        
+        for i, part in enumerate(message_parts):
+            if i == 0:
+                # Первую часть отправляем с заголовком
+                await callback.message.answer(
+                    f"🏆 **Результат проверки компетенций модератора ММ:**\n\n{part}",
+                    parse_mode="Markdown"
+                )
+            else:
+                # Остальные части просто как текст
+                await callback.message.answer(part)
+        
+        # Отправляем кнопки меню
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🏠 Главное меню", callback_data="back_to_main"),
+             InlineKeyboardButton(text="🔄 Проверить другой файл", callback_data="check_success_criteria")]
+        ])
+        
+        await callback.message.answer(
+            "✅ Проверка завершена!\n\n"
+            "Вы можете:\n"
+            "• Вернуться в главное меню\n"
+            "• Проверить другой файл",
+            reply_markup=keyboard
+        )
+        
+        # Сбрасываем состояние
+        await state.clear()
+        
+    except Exception as e:
+        error_msg = f"❌ Ошибка при проверке компетенций: {str(e)}"
+        logger.error(error_msg)
+        await callback.message.answer(error_msg)
+        await state.clear()
+    
+    await callback.answer()
+
+
+@dp.callback_query(lambda c: c.data == "upload_new_file")
+async def upload_new_file_handler(callback: types.CallbackQuery, state: FSMContext):
+    """Обработчик кнопки 'Нет, загрузить новую транскрибацию'"""
+    await state.set_state(UserStates.waiting_for_success_criteria)
+    
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="❌ Отменить", callback_data="cancel_operation")]
     ])
-
+    
     await callback.message.answer(
-        "🏆 **Проверка компетенций модератора ММ**\n\n"
-        "📄 Отправьте файл с текстом встречи (trans.docx) для проверки соответствия копметенциям модератора ММ.\n\n"
+        "📄 **Загрузка новой транскрибации**\n\n"
+        "Отправьте файл с текстом встречи (.docx или .txt) для проверки соответствия компетенциям модератора ММ.\n\n"
         "Для отмены нажмите кнопку ниже или отправьте /cancel",
         reply_markup=keyboard,
         parse_mode="Markdown"
@@ -163,8 +467,8 @@ async def handle_success_criteria_file(message: types.Message, state: FSMContext
         return
 
     file_name = message.document.file_name
-    if not file_name.lower().endswith('.docx'):
-        await message.answer("❌ Пожалуйста, отправьте файл в формате .docx")
+    if not file_name.lower().endswith(('.docx', '.txt')):
+        await message.answer("❌ Пожалуйста, отправьте файл в формате .docx или .txt")
         return
 
     await message.answer("📥 Загружаю файл для проверки компетенций модератора ММ...")
@@ -178,8 +482,20 @@ async def handle_success_criteria_file(message: types.Message, state: FSMContext
         user_folder = f"temp_files/{user_id}"
         os.makedirs(user_folder, exist_ok=True)
 
-        # Сохраняем файл
-        file_path = f"{user_folder}/success_criteria_{datetime.now().strftime('%H%M%S')}.docx"
+        # Сохраняем файл с фиксированным именем для последующего использования
+        # Определяем расширение файла
+        file_ext = os.path.splitext(file_name)[1].lower()
+        if file_ext == '.txt':
+            file_path = f"{user_folder}/trans.txt"
+        else:
+            file_path = f"{user_folder}/trans.docx"
+        
+        # Сохраняем оригинальное имя файла для отображения пользователю
+        original_filename_path = f"{user_folder}/original_filename.txt"
+        with open(original_filename_path, 'w', encoding='utf-8') as f:
+            f.write(file_name)
+        
+        # Если файл уже существует, заменяем его
         with open(file_path, 'wb') as f:
             f.write(downloaded_file.read())
 
@@ -190,6 +506,16 @@ async def handle_success_criteria_file(message: types.Message, state: FSMContext
 
         # Вызываем функцию проверки критериев успеха
         success_result = await check_success_criteria(file_path)
+
+        # Сохраняем результат проверки в файл docx
+        result_file_path = save_result_to_docx(
+            result_text=success_result,
+            original_filename=file_name,
+            result_type="competencies",
+            user_id=user_id
+        )
+        if result_file_path:
+            logger.info(f"📄 Результат проверки компетенций сохранен: {result_file_path}")
 
         # Удаляем индикатор обработки
         await bot.delete_message(chat_id=message.chat.id, message_id=processing_msg.message_id)
@@ -219,16 +545,8 @@ async def handle_success_criteria_file(message: types.Message, state: FSMContext
             "• Проверить другой файл на компетенции модератора",
             reply_markup=keyboard
         )
-
-        # Очищаем временные файлы
-        try:
-            os.remove(file_path)
-            # Удаляем всю папку пользователя если она пустая
-            if os.path.exists(user_folder) and not os.listdir(user_folder):
-                os.rmdir(user_folder)
-        except Exception as e:
-            logging.warning(f"Не удалось очистить временные файлы: {e}")
-
+        
+        # Сбрасываем состояние
         await state.clear()
 
     except Exception as e:
@@ -249,26 +567,18 @@ async def handle_success_criteria_file(message: types.Message, state: FSMContext
 
 @dp.callback_query(lambda c: c.data == "check_scenario")
 async def check_scenario_handler(callback: types.CallbackQuery, state: FSMContext):
-    """Обработчик кнопки 'Проверить ММ на соответствие сценарию'"""
-    # Показываем меню выбора типа ММ
-    scenario_keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🏨 ММ онлайн торговля", callback_data="scenario_online")],
-        [InlineKeyboardButton(text="🤝 ММ первые встречи", callback_data="scenario_first_meetings")],
-        [InlineKeyboardButton(text="📅 ММ первый месяц", callback_data="scenario_first_month")],
-        [InlineKeyboardButton(text="🤝 ММ мои встречи", callback_data="scenario_my_meetings")],
-        [InlineKeyboardButton(text="🔄 ММ универсальный сценарий", callback_data="scenario_universal")],
+    """Обработчик кнопки 'Проверить ММ на соответствие сценарию' — сразу переход на универсальный сценарий"""
+    await state.update_data(scenario_type="scenario_universal")
+    await state.set_state(UserStates.waiting_for_scenario_check)
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="❌ Отменить", callback_data="cancel_operation")]
     ])
 
     await callback.message.answer(
-        "📋 Выберите тип ММ для проверки соответствия сценарию:\n\n"
-        "🏨 **ММ онлайн торговля** - проверка соответствия сценарию ММ по онлайн торговле\n"
-        "🤝 **ММ первые встречи** - проверка первых встреч с клиентами\n"
-        "📅 **ММ первый месяц** - проверка ММ за первый месяц работы\n"
-        "🤝 **ММ мои встречи** - проверка встреч с клиентами опытных сотрудников\n"
-        "🔄 **ММ универсальный сценарий** - универсальная проверка любого типа встреч\n\n"
-        "Выберите подходящий вариант:",
-        reply_markup=scenario_keyboard,
+        "📄 Для проверки на соответствие *универсальному сценарию* отправьте файл с текстом встречи (.docx или .txt)\n\n"
+        "Для отмены нажмите кнопку ниже или отправьте /cancel",
+        reply_markup=keyboard,
         parse_mode="Markdown"
     )
     await callback.answer()
@@ -299,7 +609,7 @@ async def scenario_type_handler(callback: types.CallbackQuery, state: FSMContext
     ])
 
     await callback.message.answer(
-        f"📄 Для проверки *{scenario_name}* на соответствие сценарию отправьте файл с текстом встречи (trans.docx)\n\n"
+        f"📄 Для проверки *{scenario_name}* на соответствие сценарию отправьте файл с текстом встречи (.docx или .txt)\n\n"
         "Для отмена нажмите кнопку ниже или отправьте /cancel",
         reply_markup=keyboard,
         parse_mode="Markdown"
@@ -317,13 +627,13 @@ async def handle_scenario_check_file(message: types.Message, state: FSMContext):
         return
 
     file_name = message.document.file_name
-    if not file_name.lower().endswith('.docx'):
-        await message.answer("❌ Пожалуйста, отправьте файл в формате .docx")
+    if not file_name.lower().endswith(('.docx', '.txt')):
+        await message.answer("❌ Пожалуйста, отправьте файл в формате .docx или .txt")
         return
 
-    # Получаем выбранный тип сценария из состояния
+    # Получаем тип сценария из состояния (по умолчанию — универсальный)
     user_data = await state.get_data()
-    scenario_type = user_data.get('scenario_type', 'scenario_online')
+    scenario_type = user_data.get('scenario_type', 'scenario_universal')
 
     scenario_names = {
         "scenario_online": "ММ онлайн торговля",
@@ -346,8 +656,20 @@ async def handle_scenario_check_file(message: types.Message, state: FSMContext):
         user_folder = f"temp_files/{user_id}"
         os.makedirs(user_folder, exist_ok=True)
 
-        # Сохраняем файл
-        file_path = f"{user_folder}/scenario_check_{datetime.now().strftime('%H%M%S')}.docx"
+        # Сохраняем файл с фиксированным именем для последующего использования при проверке компетенций
+        # Определяем расширение файла
+        file_ext = os.path.splitext(file_name)[1].lower()
+        if file_ext == '.txt':
+            file_path = f"{user_folder}/trans.txt"
+        else:
+            file_path = f"{user_folder}/trans.docx"
+        
+        # Сохраняем оригинальное имя файла для отображения пользователю
+        original_filename_path = f"{user_folder}/original_filename.txt"
+        with open(original_filename_path, 'w', encoding='utf-8') as f:
+            f.write(file_name)
+        
+        # Сохраняем файл (заменяем, если уже существует)
         with open(file_path, 'wb') as f:
             f.write(downloaded_file.read())
 
@@ -356,10 +678,19 @@ async def handle_scenario_check_file(message: types.Message, state: FSMContext):
         print("DEBUG: ОБРАБОТКА ТЕКСТА ВСТРЕЧИ")
         print("=" * 80)
 
-        # Читаем оригинальный текст
-        from docx import Document
-        doc = Document(file_path)
-        original_text = '\n'.join([para.text for para in doc.paragraphs if para.text.strip()])
+        # Читаем оригинальный текст (поддерживаем .docx и .txt)
+        file_ext = os.path.splitext(file_path)[1].lower()
+        if file_ext == '.txt':
+            try:
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    original_text = f.read()
+            except UnicodeDecodeError:
+                with open(file_path, 'r', encoding='cp1251') as f:
+                    original_text = f.read()
+        else:
+            from docx import Document
+            doc = Document(file_path)
+            original_text = '\n'.join([para.text for para in doc.paragraphs if para.text.strip()])
 
         print(f"ОРИГИНАЛЬНЫЙ ТЕКСТ ({len(original_text)} символов):")
         print("-" * 40)
@@ -402,6 +733,16 @@ async def handle_scenario_check_file(message: types.Message, state: FSMContext):
         # Вызываем функцию проверки сценария с ОТФИЛЬТРОВАННЫМ файлом
         scenario_result = await check_meeting_scenario(filtered_file_path, scenario_type)
 
+        # Сохраняем результат проверки в файл docx
+        result_file_path = save_result_to_docx(
+            result_text=scenario_result,
+            original_filename=file_name,
+            result_type="scenario",
+            user_id=user_id
+        )
+        if result_file_path:
+            logger.info(f"📄 Результат проверки сценария сохранен: {result_file_path}")
+
         # Удаляем индикатор обработки
         await bot.delete_message(chat_id=message.chat.id, message_id=processing_msg.message_id)
 
@@ -430,15 +771,12 @@ async def handle_scenario_check_file(message: types.Message, state: FSMContext):
             reply_markup=keyboard
         )
 
-        # Очищаем временные файлы
+        # Удаляем только временный отфильтрованный файл
+        # Оригинальный файл (file_path) НЕ удаляем - он нужен для проверки компетенций
         try:
-            os.remove(file_path)
             os.remove(filtered_file_path)
-            # Удаляем всю папку пользователя если она пустая
-            if os.path.exists(user_folder) and not os.listdir(user_folder):
-                os.rmdir(user_folder)
         except Exception as e:
-            logging.warning(f"Не удалось очистить временные файлы: {e}")
+            logging.warning(f"Не удалось удалить временный файл: {e}")
 
         await state.clear()
 
